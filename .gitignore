@@ -1,0 +1,33 @@
+# Python-specific ignores
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.venv/
+venv/
+.env
+
+# Log files
+*.log
+nohup.out
+bot.log
+
+# Temporary files and directories
+*.tmp
+*.swp
+*.swo
+*.DS_Store
+
+# IDE specific files
+.idea/
+*.vscode/
+
+# Ignore the scripts themselves
+generate_readme.py
+watch_and_update_readme.py
+
+# Ignore test folder
+tests/
+
+# specific folders
+afadesign.official/
