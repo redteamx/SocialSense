@@ -22708,9 +22708,16 @@ import instaloader
 from rich.console import Console
 from rich.panel import Panel
 from rich.box import HEAVY
+from dotenv import load_dotenv
+
+# Load environment variables from .env file.
+load_dotenv()
 
 from like_bot.config import Config, THEMES
 from like_bot.logging import AsyncLogger
+
+# Import the AIograpi Client following best practices.
+from aiograpi import Client as AiograpiClient
 
 console = Console()
 
@@ -22720,10 +22727,10 @@ class InstagramSession:
     Manages an Instagram session using Instaloader.
 
     This class handles login using Instaloader. It first attempts to load an existing session
-    from a file (named as "<username>.session"). If the session does not exist or fails to load,
-    it performs a non-interactive login using the provided password. If two-factor authentication
-    is required, it falls back to interactive 2FA handling. The session is then saved for future use.
-    This behavior aligns with Instaloader's recommended practices.
+    from a file (named "<username>.session"). If the session does not exist or fails to load,
+    it performs an interactive login which prompts for credentials and handles two-factor authentication.
+    After a successful login, the session is saved for future use and an aiograpi client is instantiated.
+    This approach aligns with best practices from Instaloader and aiograpi.
     """
 
     def __init__(self, config: Config, async_logger: AsyncLogger) -> None:
@@ -22746,8 +22753,10 @@ class InstagramSession:
         self.loader: Optional[instaloader.Instaloader] = None
         self.session: Optional[aiohttp.ClientSession] = None
         self._logger = logging.getLogger(__name__)
-        # Use a session file named as "<username>.session" for consistency.
+        # Use a session file named as "<username>.session"
         self.session_file: str = f"{self.config.instagram_username}.session"
+        # Placeholder for the aiograpi client.
+        self.ig_client: Optional[AiograpiClient] = None
 
     async def __aenter__(self) -> "InstagramSession":
         """
@@ -22828,6 +22837,7 @@ class InstagramSession:
         finally:
             self.session = None
             self.loader = None
+            self.ig_client = None
 
     async def save_session(self, filepath: str = None) -> None:
         """
@@ -22838,7 +22848,7 @@ class InstagramSession:
         if self.loader:
             if filepath is None:
                 filepath = self.session_file
-            # Save session using only the username (per Instaloader's API).
+            # Save session using only the username.
             self.loader.save_session_to_file(self.config.instagram_username)
             self._logger.info(
                 "Session saved",
@@ -22873,51 +22883,60 @@ class InstagramSession:
     async def login(self, password: str) -> None:
         """
         Logs in to Instagram using Instaloader. If a session file exists, attempts to load it;
-        otherwise, performs a non-interactive login using the provided password.
-        If two-factor authentication is required, it falls back to interactive 2FA handling,
-        and then saves the session.
+        otherwise, performs an interactive login which prompts for credentials and handles two-factor authentication,
+        and then saves the session. After a successful login, the aiograpi client is instantiated.
+        The credentials are read from the environment variables.
 
-        :param password: Instagram account password.
+        :param password: Instagram account password (not used in interactive login).
         :raises: Exceptions from Instaloader on login failure.
         """
         logger = self._logger
+        # Override username from environment if available.
+        username = os.getenv("INSTAGRAM_USERNAME", self.config.instagram_username)
+        self.config.instagram_username = username  # Update config if needed.
+        self.session_file = f"{username}.session"  # Update session file name accordingly.
+
         # Check if a session file exists and attempt to load it.
         if os.path.exists(self.session_file):
             if await self.load_session(self.session_file):
                 self._display_panel("✅ Instaloader session loaded successfully!", "Success", "success")
                 logger.info(
                     "Instaloader session loaded successfully",
-                    extra={"function": "login", "username": self.config.instagram_username, "phase": "Login"}
+                    extra={"function": "login", "username": username, "phase": "Login"}
                 )
+                # Instantiate the aiograpi client.
+                self.ig_client = AiograpiClient()
                 return
             else:
                 logger.warning(
-                    "Session file exists but failed to load. Proceeding with login.",
+                    "Session file exists but failed to load. Proceeding with interactive login.",
                     extra={"function": "login", "phase": "Login"}
                 )
-        # Perform non-interactive login with the provided password.
+        # Use interactive login to prompt for credentials and handle 2FA.
         try:
-            self.loader.login(self.config.instagram_username, password)
-            self.loader.save_session_to_file(self.config.instagram_username)
+            self.loader.interactive_login(username)
+            self.loader.save_session_to_file(username)
             self._display_panel("✅ Instaloader login successful!", "Success", "success")
             logger.info(
                 "Instaloader logged in successfully",
-                extra={"function": "login", "username": self.config.instagram_username, "phase": "Login"}
+                extra={"function": "login", "username": username, "phase": "Login"}
             )
+            # Instantiate the aiograpi client after login.
+            self.ig_client = AiograpiClient()
         except instaloader.exceptions.TwoFactorAuthRequiredException:
             await self._handle_two_factor_auth(password)
         except instaloader.exceptions.BadCredentialsException as e:
             self._display_panel("✘ Instaloader login failed: Bad credentials", "Error", "error")
             logger.error(
                 "Instaloader login failed due to bad credentials",
-                extra={"function": "login", "username": self.config.instagram_username, "error": str(e), "phase": "Login"}
+                extra={"function": "login", "username": username, "error": str(e), "phase": "Login"}
             )
             raise
         except instaloader.exceptions.ConnectionException as e:
             self._display_panel(f"✘ Network error: {str(e)}", "Error", "error")
             logger.error(
                 "Network error during login",
-                extra={"function": "login", "username": self.config.instagram_username, "error": str(e), "phase": "Login"}
+                extra={"function": "login", "username": username, "error": str(e), "phase": "Login"}
             )
             raise
 
@@ -22938,6 +22957,8 @@ class InstagramSession:
             extra={"function": "login", "username": self.config.instagram_username, "phase": "Login"}
         )
         self.loader.save_session_to_file(self.config.instagram_username)
+        # Instantiate the aiograpi client after 2FA login.
+        self.ig_client = AiograpiClient()
 
     def _display_panel(self, message: str, title: str, theme_key: str) -> None:
         """
@@ -23826,4 +23847,4 @@ def async_retrying(
 
 
 
-Updated at: 1741937182.778209
+Updated at: 1741939795.4395716
