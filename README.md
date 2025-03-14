@@ -21759,11 +21759,11 @@ console = Console()
 
 class InstagramClient:
     """
-    A client for handling Instagram operations such as fetching profiles, liking posts,
+    A client for handling Instagram operations such as fetching profiles, liking posts, 
     tracking metrics, and updating follower statuses.
 
-    Blocking calls (e.g. Instaloader API calls) are executed in a thread pool
-    (using asyncio.to_thread) so as not to block the async event loop.
+    This version encapsulates the post-liking logic in a dedicated method, enhances error 
+    handling (including rate-limit detection), and logs debug information at key steps.
     """
 
     def __init__(self, config: Config, async_logger: AsyncLogger) -> None:
@@ -21807,14 +21807,10 @@ class InstagramClient:
     @async_retrying(max_retries=NETWORK_MAX_RETRIES, initial_delay=MIN_DELAY)
     async def fetch_profile(self, username: str, context: instaloader.InstaloaderContext) -> instaloader.Profile:
         """
-        Fetches the Instagram profile for the given username in a separate thread.
-
-        :param username: The target username.
-        :param context: Instaloader context.
-        :return: An instaloader.Profile object.
+        Fetches the Instagram profile for the given username.
         """
         await self.async_logger.debug(f"Fetching profile for user: {username}", extra={"phase": "FetchProfileStart"})
-        profile = await asyncio.to_thread(instaloader.Profile.from_username, context, username)
+        profile = instaloader.Profile.from_username(context, username)
         await self.async_logger.debug(f"Fetched profile for {username} with userid {profile.userid}", extra={"phase": "FetchProfileEnd"})
         return profile
 
@@ -21826,7 +21822,7 @@ class InstagramClient:
         await self.async_logger.debug("Starting update_follower_status", extra={"phase": "UpdateFollowerStatusStart"})
         own_profile = await self.fetch_profile(self.config.instagram_username, session.loader.context)
         await self.async_logger.debug(
-            f"Own profile {self.config.instagram_username} fetched with userid {own_profile.userid}",
+            f"Fetched own profile: {self.config.instagram_username} with userid {own_profile.userid}",
             extra={"phase": "UpdateFollowerStatus"}
         )
         current_followers = {follower.userid for follower in own_profile.get_followers()}
@@ -21855,13 +21851,16 @@ class InstagramClient:
                     ) THEN CURRENT_TIMESTAMP ELSE NULL END, $2)
                     ON CONFLICT (target_user_id) DO UPDATE SET
                         is_currently_following = $2,
-                        first_followed_at = COALESCE(target_user_follow_status.first_followed_at,
+                        first_followed_at = COALESCE(target_user_follow_status.first_followed_at, 
                             CASE WHEN $2 THEN CURRENT_TIMESTAMP ELSE NULL END)
                     """,
                     target_user_id, is_following
                 )
         await self.async_logger.debug("Completed update_follower_status", extra={"phase": "UpdateFollowerStatusEnd"})
-        await self.async_logger.info("Follower status updated", extra={"function": "update_follower_status", "phase": "Follower Tracking"})
+        await self.async_logger.info(
+            "Follower status updated",
+            extra={"function": "update_follower_status", "phase": "Follower Tracking"}
+        )
 
     async def update_metrics(self, db: Database) -> None:
         """
@@ -21931,7 +21930,10 @@ class InstagramClient:
         """
         async with self.semaphore:
             start_time = time.perf_counter()
-            await self.async_logger.debug(f"Starting processing for user: {username}", extra={"phase": "ProcessUserStart"})
+            await self.async_logger.debug(
+                f"Starting processing for user: {username}",
+                extra={"phase": "ProcessUserStart"}
+            )
             self.current_phase = "Processing"
             self.current_op = f"Processing {username}"
 
@@ -21950,18 +21952,36 @@ class InstagramClient:
                 live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
                 return
 
-            await self.async_logger.info("Starting user processing", extra={"function": "process_user", "username": username, "retry_count": retry_count, "phase": "Processing"})
+            await self.async_logger.info(
+                "Starting user processing",
+                extra={"function": "process_user", "username": username, "retry_count": retry_count, "phase": "Processing"}
+            )
             progress.update(task_id, description=f"Processing {username}")
             live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
 
+            profile: Optional[instaloader.Profile] = None
             try:
-                # Fetch profile in a separate thread.
                 profile = await self.fetch_profile(username, session.loader.context)
                 async with db.pool.acquire() as conn:
-                    await conn.execute("UPDATE target_users SET profile_id = $1 WHERE username = $2", profile.userid, username)
-                await self.async_logger.info("Profile fetched", extra={"function": "process_user", "username": username, "profile_id": profile.userid, "post_count": profile.mediacount, "phase": "Processing"})
+                    await conn.execute(
+                        "UPDATE target_users SET profile_id = $1 WHERE username = $2",
+                        profile.userid, username
+                    )
+                await self.async_logger.info(
+                    "Profile fetched",
+                    extra={
+                        "function": "process_user",
+                        "username": username,
+                        "profile_id": profile.userid,
+                        "post_count": profile.mediacount,
+                        "phase": "Processing"
+                    }
+                )
             except instaloader.exceptions.ProfileNotExistsException as e:
-                await self.async_logger.info("Profile does not exist, skipping", extra={"function": "process_user", "username": username, "error": str(e), "phase": "Processing"})
+                await self.async_logger.info(
+                    "Profile does not exist, skipping",
+                    extra={"function": "process_user", "username": username, "error": str(e), "phase": "Processing"}
+                )
                 status = ProcessingStatus.SKIPPED.value
                 self.stats["skipped"] += 1
                 self.status_buffer.append((Text(f"⏸️ Skipped {username} (profile does not exist)", style="yellow"), time.time()))
@@ -21972,7 +21992,10 @@ class InstagramClient:
                 live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
                 return
             except Exception as e:
-                await self.async_logger.warning("Transient error fetching profile", extra={"function": "process_user", "username": username, "error": str(e), "phase": "Processing"})
+                await self.async_logger.warning(
+                    "Transient error fetching profile",
+                    extra={"function": "process_user", "username": username, "error": str(e), "phase": "Processing"}
+                )
                 status = ProcessingStatus.RETRY.value
                 retry_count += 1
                 self.stats["retries"] += 1
@@ -21996,7 +22019,6 @@ class InstagramClient:
                 live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
                 return
 
-            # Check if the bot's own profile follows the target user.
             own_profile = await self.fetch_profile(self.config.instagram_username, session.loader.context)
             follows_us = profile.userid in {follower.userid for follower in own_profile.get_followers()}
             if follows_us:
@@ -22011,14 +22033,13 @@ class InstagramClient:
                 live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
                 return
 
-            # Iterate over posts in a thread to avoid blocking.
             posts = profile.get_posts()
             post_iterator = iter(posts)
             post_to_like = None
             post_number = 0
             while True:
                 try:
-                    post = await asyncio.to_thread(next, post_iterator)
+                    post = next(post_iterator)
                     post_number += 1
                     if not post.viewer_has_liked:
                         post_to_like = post
@@ -22037,7 +22058,12 @@ class InstagramClient:
 
             await self.async_logger.info(
                 f"Fetched post #{post_number} to like",
-                extra={"function": "process_user", "username": username, "shortcode": post_to_like.shortcode, "phase": "Processing"}
+                extra={
+                    "function": "process_user",
+                    "username": username,
+                    "shortcode": post_to_like.shortcode,
+                    "phase": "Processing"
+                }
             )
             await asyncio.sleep(self.config.intra_request_delay)
 
@@ -22095,7 +22121,13 @@ class InstagramClient:
                     wait_time = min((2 ** attempt) * RATE_LIMIT_DELAY + random.uniform(0, 1), MAX_DELAY)
                     await self.async_logger.warning(
                         "Rate limited when liking post",
-                        extra={"username": username, "attempt": attempt + 1, "max_retries": MAX_RETRIES, "delay": wait_time, "phase": "Processing"}
+                        extra={
+                            "username": username,
+                            "attempt": attempt + 1,
+                            "max_retries": MAX_RETRIES,
+                            "delay": wait_time,
+                            "phase": "Processing"
+                        }
                     )
                     self.status_buffer.append((Text(f"Rate limited for {username}, waiting {wait_time:.1f}s ⏳", style="yellow"), time.time()))
                     await asyncio.sleep(wait_time)
@@ -22279,12 +22311,17 @@ class InstagramClient:
         Gracefully shuts down the client by generating a summary report and signaling termination.
         """
         self.current_op = "Shutting down"
-        await self.async_logger.info("Shutting down gracefully", extra={"function": "shutdown", "phase": "Shutdown"})
+        await self.async_logger.info(
+            "Shutting down gracefully",
+            extra={"function": "shutdown", "phase": "Shutdown"}
+        )
         self.generate_summary()
-        console.print(Panel(f"Shutting down... Summary saved to {SUMMARY_FILE}",
-                            title="Shutdown",
-                            border_style=THEMES[self.config.theme]["warning"],
-                            box=HEAVY))
+        console.print(Panel(
+            f"Shutting down... Summary saved to {SUMMARY_FILE}",
+            title="Shutdown",
+            border_style=THEMES[self.config.theme]["warning"],
+            box=HEAVY
+        ))
         stop_event.set()
         sys.exit(0)
 
@@ -22671,16 +22708,9 @@ import instaloader
 from rich.console import Console
 from rich.panel import Panel
 from rich.box import HEAVY
-from dotenv import load_dotenv
-
-# Load environment variables from .env file.
-load_dotenv()
 
 from like_bot.config import Config, THEMES
 from like_bot.logging import AsyncLogger
-
-# Import the AIograpi Client following best practices.
-from aiograpi import Client as AiograpiClient
 
 console = Console()
 
@@ -22690,10 +22720,10 @@ class InstagramSession:
     Manages an Instagram session using Instaloader.
 
     This class handles login using Instaloader. It first attempts to load an existing session
-    from a file (named "<username>.session"). If the session does not exist or fails to load,
-    it performs an interactive login which prompts for credentials and handles two-factor authentication.
-    After a successful login, the session is saved for future use and an aiograpi client is instantiated.
-    This approach aligns with best practices from Instaloader and aiograpi.
+    from a file (named as "<username>.session"). If the session does not exist or fails to load,
+    it performs a non-interactive login using the provided password. If two-factor authentication
+    is required, it falls back to interactive 2FA handling. The session is then saved for future use.
+    This behavior aligns with Instaloader's recommended practices.
     """
 
     def __init__(self, config: Config, async_logger: AsyncLogger) -> None:
@@ -22716,10 +22746,8 @@ class InstagramSession:
         self.loader: Optional[instaloader.Instaloader] = None
         self.session: Optional[aiohttp.ClientSession] = None
         self._logger = logging.getLogger(__name__)
-        # Use a session file named as "<username>.session"
+        # Use a session file named as "<username>.session" for consistency.
         self.session_file: str = f"{self.config.instagram_username}.session"
-        # Placeholder for the aiograpi client.
-        self.ig_client: Optional[AiograpiClient] = None
 
     async def __aenter__(self) -> "InstagramSession":
         """
@@ -22800,7 +22828,6 @@ class InstagramSession:
         finally:
             self.session = None
             self.loader = None
-            self.ig_client = None
 
     async def save_session(self, filepath: str = None) -> None:
         """
@@ -22811,7 +22838,7 @@ class InstagramSession:
         if self.loader:
             if filepath is None:
                 filepath = self.session_file
-            # Save session using only the username.
+            # Save session using only the username (per Instaloader's API).
             self.loader.save_session_to_file(self.config.instagram_username)
             self._logger.info(
                 "Session saved",
@@ -22846,60 +22873,51 @@ class InstagramSession:
     async def login(self, password: str) -> None:
         """
         Logs in to Instagram using Instaloader. If a session file exists, attempts to load it;
-        otherwise, performs an interactive login which prompts for credentials and handles two-factor authentication,
-        and then saves the session. After a successful login, the aiograpi client is instantiated.
-        The credentials are read from the environment variables.
+        otherwise, performs a non-interactive login using the provided password.
+        If two-factor authentication is required, it falls back to interactive 2FA handling,
+        and then saves the session.
 
-        :param password: Instagram account password (not used in interactive login).
+        :param password: Instagram account password.
         :raises: Exceptions from Instaloader on login failure.
         """
         logger = self._logger
-        # Override username from environment if available.
-        username = os.getenv("INSTAGRAM_USERNAME", self.config.instagram_username)
-        self.config.instagram_username = username  # Update config if needed.
-        self.session_file = f"{username}.session"  # Update session file name accordingly.
-
         # Check if a session file exists and attempt to load it.
         if os.path.exists(self.session_file):
             if await self.load_session(self.session_file):
                 self._display_panel("✅ Instaloader session loaded successfully!", "Success", "success")
                 logger.info(
                     "Instaloader session loaded successfully",
-                    extra={"function": "login", "username": username, "phase": "Login"}
+                    extra={"function": "login", "username": self.config.instagram_username, "phase": "Login"}
                 )
-                # Instantiate the aiograpi client.
-                self.ig_client = AiograpiClient()
                 return
             else:
                 logger.warning(
-                    "Session file exists but failed to load. Proceeding with interactive login.",
+                    "Session file exists but failed to load. Proceeding with login.",
                     extra={"function": "login", "phase": "Login"}
                 )
-        # Use interactive login to prompt for credentials and handle 2FA.
+        # Perform non-interactive login with the provided password.
         try:
-            self.loader.interactive_login(username)
-            self.loader.save_session_to_file(username)
+            self.loader.login(self.config.instagram_username, password)
+            self.loader.save_session_to_file(self.config.instagram_username)
             self._display_panel("✅ Instaloader login successful!", "Success", "success")
             logger.info(
                 "Instaloader logged in successfully",
-                extra={"function": "login", "username": username, "phase": "Login"}
+                extra={"function": "login", "username": self.config.instagram_username, "phase": "Login"}
             )
-            # Instantiate the aiograpi client after login.
-            self.ig_client = AiograpiClient()
         except instaloader.exceptions.TwoFactorAuthRequiredException:
             await self._handle_two_factor_auth(password)
         except instaloader.exceptions.BadCredentialsException as e:
             self._display_panel("✘ Instaloader login failed: Bad credentials", "Error", "error")
             logger.error(
                 "Instaloader login failed due to bad credentials",
-                extra={"function": "login", "username": username, "error": str(e), "phase": "Login"}
+                extra={"function": "login", "username": self.config.instagram_username, "error": str(e), "phase": "Login"}
             )
             raise
         except instaloader.exceptions.ConnectionException as e:
             self._display_panel(f"✘ Network error: {str(e)}", "Error", "error")
             logger.error(
                 "Network error during login",
-                extra={"function": "login", "username": username, "error": str(e), "phase": "Login"}
+                extra={"function": "login", "username": self.config.instagram_username, "error": str(e), "phase": "Login"}
             )
             raise
 
@@ -22920,8 +22938,6 @@ class InstagramSession:
             extra={"function": "login", "username": self.config.instagram_username, "phase": "Login"}
         )
         self.loader.save_session_to_file(self.config.instagram_username)
-        # Instantiate the aiograpi client after 2FA login.
-        self.ig_client = AiograpiClient()
 
     def _display_panel(self, message: str, title: str, theme_key: str) -> None:
         """
@@ -23810,4 +23826,4 @@ def async_retrying(
 
 
 
-Updated at: 1741940372.6155915
+Updated at: 1741941640.371885
