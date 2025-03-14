@@ -21759,11 +21759,11 @@ console = Console()
 
 class InstagramClient:
     """
-    A client for handling Instagram operations such as fetching profiles, liking posts, 
+    A client for handling Instagram operations such as fetching profiles, liking posts,
     tracking metrics, and updating follower statuses.
 
-    This version encapsulates the post-liking logic in a dedicated method, enhances error 
-    handling (including rate-limit detection), and logs debug information at key steps.
+    Blocking calls (e.g. Instaloader API calls) are executed in a thread pool
+    (using asyncio.to_thread) so as not to block the async event loop.
     """
 
     def __init__(self, config: Config, async_logger: AsyncLogger) -> None:
@@ -21807,10 +21807,14 @@ class InstagramClient:
     @async_retrying(max_retries=NETWORK_MAX_RETRIES, initial_delay=MIN_DELAY)
     async def fetch_profile(self, username: str, context: instaloader.InstaloaderContext) -> instaloader.Profile:
         """
-        Fetches the Instagram profile for the given username.
+        Fetches the Instagram profile for the given username in a separate thread.
+
+        :param username: The target username.
+        :param context: Instaloader context.
+        :return: An instaloader.Profile object.
         """
         await self.async_logger.debug(f"Fetching profile for user: {username}", extra={"phase": "FetchProfileStart"})
-        profile = instaloader.Profile.from_username(context, username)
+        profile = await asyncio.to_thread(instaloader.Profile.from_username, context, username)
         await self.async_logger.debug(f"Fetched profile for {username} with userid {profile.userid}", extra={"phase": "FetchProfileEnd"})
         return profile
 
@@ -21822,7 +21826,7 @@ class InstagramClient:
         await self.async_logger.debug("Starting update_follower_status", extra={"phase": "UpdateFollowerStatusStart"})
         own_profile = await self.fetch_profile(self.config.instagram_username, session.loader.context)
         await self.async_logger.debug(
-            f"Fetched own profile: {self.config.instagram_username} with userid {own_profile.userid}",
+            f"Own profile {self.config.instagram_username} fetched with userid {own_profile.userid}",
             extra={"phase": "UpdateFollowerStatus"}
         )
         current_followers = {follower.userid for follower in own_profile.get_followers()}
@@ -21851,16 +21855,13 @@ class InstagramClient:
                     ) THEN CURRENT_TIMESTAMP ELSE NULL END, $2)
                     ON CONFLICT (target_user_id) DO UPDATE SET
                         is_currently_following = $2,
-                        first_followed_at = COALESCE(target_user_follow_status.first_followed_at, 
+                        first_followed_at = COALESCE(target_user_follow_status.first_followed_at,
                             CASE WHEN $2 THEN CURRENT_TIMESTAMP ELSE NULL END)
                     """,
                     target_user_id, is_following
                 )
         await self.async_logger.debug("Completed update_follower_status", extra={"phase": "UpdateFollowerStatusEnd"})
-        await self.async_logger.info(
-            "Follower status updated",
-            extra={"function": "update_follower_status", "phase": "Follower Tracking"}
-        )
+        await self.async_logger.info("Follower status updated", extra={"function": "update_follower_status", "phase": "Follower Tracking"})
 
     async def update_metrics(self, db: Database) -> None:
         """
@@ -21930,10 +21931,7 @@ class InstagramClient:
         """
         async with self.semaphore:
             start_time = time.perf_counter()
-            await self.async_logger.debug(
-                f"Starting processing for user: {username}",
-                extra={"phase": "ProcessUserStart"}
-            )
+            await self.async_logger.debug(f"Starting processing for user: {username}", extra={"phase": "ProcessUserStart"})
             self.current_phase = "Processing"
             self.current_op = f"Processing {username}"
 
@@ -21952,36 +21950,18 @@ class InstagramClient:
                 live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
                 return
 
-            await self.async_logger.info(
-                "Starting user processing",
-                extra={"function": "process_user", "username": username, "retry_count": retry_count, "phase": "Processing"}
-            )
+            await self.async_logger.info("Starting user processing", extra={"function": "process_user", "username": username, "retry_count": retry_count, "phase": "Processing"})
             progress.update(task_id, description=f"Processing {username}")
             live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
 
-            profile: Optional[instaloader.Profile] = None
             try:
+                # Fetch profile in a separate thread.
                 profile = await self.fetch_profile(username, session.loader.context)
                 async with db.pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE target_users SET profile_id = $1 WHERE username = $2",
-                        profile.userid, username
-                    )
-                await self.async_logger.info(
-                    "Profile fetched",
-                    extra={
-                        "function": "process_user",
-                        "username": username,
-                        "profile_id": profile.userid,
-                        "post_count": profile.mediacount,
-                        "phase": "Processing"
-                    }
-                )
+                    await conn.execute("UPDATE target_users SET profile_id = $1 WHERE username = $2", profile.userid, username)
+                await self.async_logger.info("Profile fetched", extra={"function": "process_user", "username": username, "profile_id": profile.userid, "post_count": profile.mediacount, "phase": "Processing"})
             except instaloader.exceptions.ProfileNotExistsException as e:
-                await self.async_logger.info(
-                    "Profile does not exist, skipping",
-                    extra={"function": "process_user", "username": username, "error": str(e), "phase": "Processing"}
-                )
+                await self.async_logger.info("Profile does not exist, skipping", extra={"function": "process_user", "username": username, "error": str(e), "phase": "Processing"})
                 status = ProcessingStatus.SKIPPED.value
                 self.stats["skipped"] += 1
                 self.status_buffer.append((Text(f"⏸️ Skipped {username} (profile does not exist)", style="yellow"), time.time()))
@@ -21992,10 +21972,7 @@ class InstagramClient:
                 live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
                 return
             except Exception as e:
-                await self.async_logger.warning(
-                    "Transient error fetching profile",
-                    extra={"function": "process_user", "username": username, "error": str(e), "phase": "Processing"}
-                )
+                await self.async_logger.warning("Transient error fetching profile", extra={"function": "process_user", "username": username, "error": str(e), "phase": "Processing"})
                 status = ProcessingStatus.RETRY.value
                 retry_count += 1
                 self.stats["retries"] += 1
@@ -22019,6 +21996,7 @@ class InstagramClient:
                 live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
                 return
 
+            # Check if the bot's own profile follows the target user.
             own_profile = await self.fetch_profile(self.config.instagram_username, session.loader.context)
             follows_us = profile.userid in {follower.userid for follower in own_profile.get_followers()}
             if follows_us:
@@ -22033,13 +22011,14 @@ class InstagramClient:
                 live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
                 return
 
+            # Iterate over posts in a thread to avoid blocking.
             posts = profile.get_posts()
             post_iterator = iter(posts)
             post_to_like = None
             post_number = 0
             while True:
                 try:
-                    post = next(post_iterator)
+                    post = await asyncio.to_thread(next, post_iterator)
                     post_number += 1
                     if not post.viewer_has_liked:
                         post_to_like = post
@@ -22058,12 +22037,7 @@ class InstagramClient:
 
             await self.async_logger.info(
                 f"Fetched post #{post_number} to like",
-                extra={
-                    "function": "process_user",
-                    "username": username,
-                    "shortcode": post_to_like.shortcode,
-                    "phase": "Processing"
-                }
+                extra={"function": "process_user", "username": username, "shortcode": post_to_like.shortcode, "phase": "Processing"}
             )
             await asyncio.sleep(self.config.intra_request_delay)
 
@@ -22121,13 +22095,7 @@ class InstagramClient:
                     wait_time = min((2 ** attempt) * RATE_LIMIT_DELAY + random.uniform(0, 1), MAX_DELAY)
                     await self.async_logger.warning(
                         "Rate limited when liking post",
-                        extra={
-                            "username": username,
-                            "attempt": attempt + 1,
-                            "max_retries": MAX_RETRIES,
-                            "delay": wait_time,
-                            "phase": "Processing"
-                        }
+                        extra={"username": username, "attempt": attempt + 1, "max_retries": MAX_RETRIES, "delay": wait_time, "phase": "Processing"}
                     )
                     self.status_buffer.append((Text(f"Rate limited for {username}, waiting {wait_time:.1f}s ⏳", style="yellow"), time.time()))
                     await asyncio.sleep(wait_time)
@@ -22311,17 +22279,12 @@ class InstagramClient:
         Gracefully shuts down the client by generating a summary report and signaling termination.
         """
         self.current_op = "Shutting down"
-        await self.async_logger.info(
-            "Shutting down gracefully",
-            extra={"function": "shutdown", "phase": "Shutdown"}
-        )
+        await self.async_logger.info("Shutting down gracefully", extra={"function": "shutdown", "phase": "Shutdown"})
         self.generate_summary()
-        console.print(Panel(
-            f"Shutting down... Summary saved to {SUMMARY_FILE}",
-            title="Shutdown",
-            border_style=THEMES[self.config.theme]["warning"],
-            box=HEAVY
-        ))
+        console.print(Panel(f"Shutting down... Summary saved to {SUMMARY_FILE}",
+                            title="Shutdown",
+                            border_style=THEMES[self.config.theme]["warning"],
+                            box=HEAVY))
         stop_event.set()
         sys.exit(0)
 
@@ -23847,4 +23810,4 @@ def async_retrying(
 
 
 
-Updated at: 1741939795.4395716
+Updated at: 1741940372.6155915
