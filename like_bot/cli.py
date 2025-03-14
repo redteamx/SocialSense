@@ -1,12 +1,11 @@
+#!/usr/bin/env python3
 import asyncio
 import os
 import sys
 import signal
-import logging
-from datetime import datetime
 from getpass import getpass
+from typing import Optional, List, Deque
 from collections import deque
-from typing import Optional
 
 import click
 from rich.console import Console
@@ -22,13 +21,6 @@ from like_bot.utils import validate_positive, validate_concurrency
 from like_bot.database import Database
 from like_bot.instagram_session import InstagramSession
 from like_bot.instagram_client import InstagramClient
-import inspect
-
-# Debug prints to confirm module-level imports.
-print(f"Imported Database from: {Database.__module__}")
-print(f"Database.__aenter__ location: {Database.__aenter__.__code__.co_filename}")
-print(f"Database.__aenter__ signature: {inspect.signature(Database.__aenter__)}")
-print(f"Imported InstagramClient from: {InstagramClient.__module__}")
 
 console = Console()
 
@@ -72,12 +64,32 @@ console = Console()
     help=f"Maximum concurrent user processing (default: {Config.concurrency_limit})"
 )
 @click.pass_context
-def cli(ctx: click.Context, log_level: str, verbose: bool, theme: str, request_delay: float, intra_request_delay: float, concurrency_limit: int) -> None:
+def cli(
+    ctx: click.Context,
+    log_level: str,
+    verbose: bool,
+    theme: str,
+    request_delay: float,
+    intra_request_delay: float,
+    concurrency_limit: int
+) -> None:
     """
     Main CLI group for the Instagram Like Bot.
 
-    This function initializes logging, configuration, and shared objects that are passed to subcommands.
-    If no subcommand is provided, it displays a welcome message and exits.
+    Initializes logging, configuration, and shared objects that are passed to subcommands.
+    If no subcommand is provided, displays a welcome message and exits.
+
+    Args:
+        ctx (click.Context): The Click context object for passing data to subcommands.
+        log_level (str): The logging level ("DEBUG", "INFO", "WARNING", "ERROR").
+        verbose (bool): Whether to enable verbose output.
+        theme (str): The UI theme to use.
+        request_delay (float): Delay between processing users in seconds.
+        intra_request_delay (float): Delay between requests within a user in seconds.
+        concurrency_limit (int): Maximum concurrent user processing tasks.
+
+    Returns:
+        None
     """
     if ctx.invoked_subcommand is None:
         console.print(
@@ -88,9 +100,13 @@ def cli(ctx: click.Context, log_level: str, verbose: bool, theme: str, request_d
         )
         ctx.exit(0)
 
-    # Setup logging and configuration.
-    log_buffer = deque(maxlen=50)
-    logger, async_logger, stop_event = setup_logging(log_level, verbose, theme, log_buffer)
+    # Setup logging and configuration
+    log_buffer: Deque[str] = deque(maxlen=50)
+    try:
+        logger, async_logger, stop_event = setup_logging(log_level, verbose, theme, log_buffer)
+    except Exception as e:
+        console.print(f"ERROR: Failed to setup logging: {str(e)}", style="red")
+        sys.exit(1)
     ctx.obj = {
         "config": Config(
             log_level=log_level,
@@ -124,8 +140,16 @@ def run(ctx: click.Context, file: str, limit: Optional[int]) -> None:
     """
     Runs the Instagram Like Bot.
 
-    This command reads usernames from a specified file, logs into Instagram, and processes users
+    Reads usernames from a specified file, logs into Instagram, and processes users
     by liking their posts according to the defined parameters.
+
+    Args:
+        ctx (click.Context): The Click context containing configuration and logging objects.
+        file (str): Path to the file containing Instagram usernames.
+        limit (Optional[int]): Maximum number of users to process; None means no limit.
+
+    Raises:
+        SystemExit: If an error occurs during async execution.
     """
     console.print(
         f"Starting bot with file: {file}",
@@ -142,20 +166,106 @@ def run(ctx: click.Context, file: str, limit: Optional[int]) -> None:
         ))
         sys.exit(1)
 
+async def _read_usernames_from_file(file_path: str, limit: Optional[int], async_logger) -> List[str]:
+    """
+    Reads usernames from the specified file with an optional limit.
+
+    Args:
+        file_path (str): Path to the file containing usernames.
+        limit (Optional[int]): Maximum number of usernames to read; None means no limit.
+        async_logger: Logger instance for logging errors and info.
+
+    Returns:
+        List[str]: List of usernames read from the file.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        IOError: If there's an error reading the file.
+        ValueError: If the file is empty or contains no valid usernames.
+    """
+    if not os.path.exists(file_path):
+        await async_logger.error(
+            "File does not exist",
+            extra={"file": file_path, "phase": "Setup"}
+        )
+        raise FileNotFoundError(f"File {file_path} does not exist")
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            usernames = [
+                line.strip()
+                for i, line in enumerate(f)
+                if line.strip() and (limit is None or i < limit)
+            ]
+        if not usernames:
+            await async_logger.error(
+                "File is empty or contains no valid usernames",
+                extra={"file": file_path, "phase": "Setup"}
+            )
+            raise ValueError(f"File {file_path} is empty or contains no valid usernames")
+        return usernames
+    except IOError as e:
+        await async_logger.error(
+            "Error reading file",
+            extra={"file": file_path, "error": str(e), "phase": "Setup"}
+        )
+        raise IOError(f"Error reading {file_path}: {str(e)}") from e
+
+async def _prompt_for_password(config: Config, async_logger) -> str:
+    """
+    Prompts the user for their Instagram password securely.
+
+    Args:
+        config (Config): Configuration object containing the Instagram username.
+        async_logger: Logger instance for logging errors and info.
+
+    Returns:
+        str: The password entered by the user.
+
+    Raises:
+        KeyboardInterrupt: If the user interrupts the password prompt.
+        EOFError: If an EOF occurs during input.
+        ValueError: If the password is empty.
+    """
+    try:
+        console.print(
+            f"🔑 Please enter your Instagram password for {config.instagram_username}",
+            style="yellow"
+        )
+        password = getpass("Password: ")
+        if not password:
+            await async_logger.error(
+                "No password provided",
+                extra={"phase": "Login"}
+            )
+            raise ValueError("Password cannot be empty")
+        return password
+    except (KeyboardInterrupt, EOFError) as e:
+        await async_logger.error(
+            "Password prompt interrupted",
+            extra={"error": str(e), "phase": "Login"},
+            exc_info=True
+        )
+        raise
+
 async def run_async(ctx: click.Context, file: str, limit: Optional[int]) -> None:
     """
     Asynchronous main execution for processing Instagram users.
 
-    This function initializes the Instagram client, database, and session, then logs in to Instagram,
+    Initializes the Instagram client, database, and session, logs in to Instagram,
     reads usernames from a file, inserts them into the database, and processes pending users.
-    It also handles periodic metrics updates and graceful shutdown on signal interruption.
+    Handles periodic metrics updates and graceful shutdown on signal interruption.
 
-    :param ctx: Click context with shared configuration and logging objects.
-    :param file: Path to the file containing Instagram usernames.
-    :param limit: Optional limit on the number of usernames to process.
+    Args:
+        ctx (click.Context): Click context with shared configuration and logging objects.
+        file (str): Path to the file containing Instagram usernames.
+        limit (Optional[int]): Optional limit on the number of usernames to process.
+
+    Raises:
+        SystemExit: If a critical error occurs during execution.
     """
-    config = ctx.obj["config"]
-    log_buffer = ctx.obj["log_buffer"]
+    config: Config = ctx.obj["config"]
+    log_buffer: Deque[str] = ctx.obj["log_buffer"]
     async_logger = ctx.obj["async_logger"]
     stop_event = ctx.obj["stop_event"]
 
@@ -164,63 +274,38 @@ async def run_async(ctx: click.Context, file: str, limit: Optional[int]) -> None
     client = InstagramClient(config, async_logger)
     client.log_buffer = log_buffer
 
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(client.shutdown(stop_event)))
+    # Setup signal handlers for graceful shutdown
+    try:
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(client.shutdown(stop_event)))
+    except Exception as e:
+        await async_logger.error(
+            "Failed to setup signal handlers",
+            extra={"error": str(e), "phase": "Setup"},
+            exc_info=True
+        )
+        console.print(f"ERROR: Failed to setup signal handlers: {str(e)}", style="red")
+        sys.exit(1)
 
     try:
-        # Debug the Database instance at runtime.
-        db_instance = Database(config, async_logger)
-        print(f"Runtime Database.__aenter__ signature: {inspect.signature(db_instance.__aenter__)}")
-        print(f"Runtime Database.__aenter__ location: {db_instance.__aenter__.__code__.co_filename}")
-
-        async with db_instance as db:
+        async with Database(config, async_logger) as db:
             async with InstagramSession(config, async_logger) as session:
-                console.print(
-                    f"🔑 Please enter your Instagram password for {config.instagram_username}",
-                    style="yellow"
-                )
-                password = getpass("Password: ")
+                # Prompt for Instagram password and login
+                password = await _prompt_for_password(config, async_logger)
                 await session.login(password)
                 await async_logger.info("Logged in successfully", extra={"phase": "Login"})
 
                 with Live(console=console, refresh_per_second=4, transient=False) as live:
-                    client.current_op = f"Checking {file} existence"
-                    live.update(client.generate_dashboard(0))
-                    if not os.path.exists(file):
-                        console.print(
-                            Panel(
-                                f"✘ File {file} does not exist.",
-                                title="Error",
-                                border_style=THEMES[config.theme]["error"],
-                                box=HEAVY
-                            )
-                        )
-                        sys.exit(1)
-
+                    # Read usernames from file
                     client.current_op = f"Reading usernames from {file}"
                     live.update(client.generate_dashboard(0))
                     try:
-                        with open(file, "r", encoding="utf-8") as f:
-                            usernames = [
-                                line.strip()
-                                for i, line in enumerate(f)
-                                if line.strip() and (limit is None or i < limit)
-                            ]
-                        if not usernames:
-                            console.print(
-                                Panel(
-                                    f"✘ File {file} is empty or contains no valid usernames.",
-                                    title="Error",
-                                    border_style=THEMES[config.theme]["error"],
-                                    box=HEAVY
-                                )
-                            )
-                            sys.exit(1)
-                    except Exception as e:
+                        usernames = await _read_usernames_from_file(file, limit, async_logger)
+                    except (FileNotFoundError, IOError, ValueError) as e:
                         console.print(
                             Panel(
-                                f"✘ Error reading {file}: {str(e)}.",
+                                f"✘ {str(e)}.",
                                 title="Error",
                                 border_style=THEMES[config.theme]["error"],
                                 box=HEAVY
@@ -232,10 +317,12 @@ async def run_async(ctx: click.Context, file: str, limit: Optional[int]) -> None
                         extra={"function": "run_async", "file": file, "count": len(usernames), "phase": "Setup"}
                     )
 
+                    # Insert users into database
                     client.current_op = "Inserting users into database"
                     live.update(client.generate_dashboard(0))
                     await db.insert_users(usernames)
 
+                    # Fetch pending users
                     client.current_op = "Fetching pending users"
                     live.update(client.generate_dashboard(0))
                     pending_users = await db.get_pending_users()
@@ -250,6 +337,7 @@ async def run_async(ctx: click.Context, file: str, limit: Optional[int]) -> None
                         )
                         return
 
+                    # Setup progress bar for user processing
                     progress = Progress(
                         SpinnerColumn(),
                         TextColumn("[progress.description]{task.description}"),
@@ -263,6 +351,7 @@ async def run_async(ctx: click.Context, file: str, limit: Optional[int]) -> None
                     client.current_op = "Starting user processing"
                     live.update(client.generate_dashboard(len(pending_users), progress=progress))
 
+                    # Start metrics update task and process users concurrently
                     metrics_task = asyncio.create_task(client.periodic_update_metrics(db, session, METRICS_UPDATE_INTERVAL))
                     tasks = [
                         client.process_user(username, progress, task_id, live, db, session)
@@ -270,12 +359,13 @@ async def run_async(ctx: click.Context, file: str, limit: Optional[int]) -> None
                     ]
                     await asyncio.gather(*tasks)
 
-                    # Batch end animation.
+                    # Batch end animation
                     for i in range(3):
                         client.current_op = BATCH_END_ANIM[i % len(BATCH_END_ANIM)]
                         live.update(client.generate_dashboard(0, "N/A", progress, anim_frame=i))
                         await asyncio.sleep(0.3)
 
+                    # Finalize processing
                     await client.update_follower_status(db, session)
                     await client.update_metrics(db)
                     client.generate_summary()
@@ -315,21 +405,40 @@ def migrate(ctx: click.Context) -> None:
     """
     Resets the database schema by performing a migration.
 
-    This command drops existing tables and recreates them using the configured schema.
+    Drops existing tables and recreates them using the configured schema.
+
+    Args:
+        ctx (click.Context): The Click context containing configuration and logging objects.
+
+    Raises:
+        SystemExit: If an error occurs during migration.
     """
     console.print(
         f"Resetting database schema...",
         style=f"bold {THEMES[ctx.obj['config'].theme]['warning']}"
     )
-    asyncio.run(migrate_async(ctx))
+    try:
+        asyncio.run(migrate_async(ctx))
+    except Exception as e:
+        console.print(f"ERROR: Failed to run migration: {str(e)}", style="red")
+        asyncio.run(ctx.obj["async_logger"].error(
+            "Failed to start migration",
+            extra={"error": str(e), "phase": "Migrate"},
+            exc_info=True
+        ))
+        sys.exit(1)
 
 async def migrate_async(ctx: click.Context) -> None:
     """
     Asynchronous migration process that resets the database schema.
 
-    :param ctx: Click context containing configuration and logging objects.
+    Args:
+        ctx (click.Context): Click context containing configuration and logging objects.
+
+    Raises:
+        SystemExit: If migration fails due to timeout or unexpected errors.
     """
-    config = ctx.obj["config"]
+    config: Config = ctx.obj["config"]
     async_logger = ctx.obj["async_logger"]
     stop_event = ctx.obj["stop_event"]
 
@@ -380,8 +489,8 @@ async def migrate_async(ctx: click.Context) -> None:
                 )
             )
             sys.exit(1)
-    stop_event.set()
+        finally:
+            stop_event.set()
 
 if __name__ == "__main__":
     cli()
-
