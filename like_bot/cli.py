@@ -274,11 +274,28 @@ async def run_async(ctx: click.Context, file: str, limit: Optional[int]) -> None
     client = InstagramClient(config, async_logger)
     client.log_buffer = log_buffer
 
+    # List to store all tasks
+    tasks = []
+
     # Setup signal handlers for graceful shutdown
+    async def shutdown_handler():
+        await async_logger.info("Received shutdown signal", extra={"phase": "Shutdown"})
+        # Cancel all running tasks
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        # Await cancelled tasks to ensure they complete or raise exceptions
+        try:
+            await asyncio.gather(*[t for t in tasks if not t.done()], return_exceptions=True)
+        except asyncio.CancelledError:
+            pass  # Expected during shutdown
+        # Shutdown client and set stop event
+        await client.shutdown(stop_event)
+
     try:
         loop = asyncio.get_event_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(client.shutdown(stop_event)))
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown_handler()))
     except Exception as e:
         await async_logger.error(
             "Failed to setup signal handlers",
@@ -287,6 +304,14 @@ async def run_async(ctx: click.Context, file: str, limit: Optional[int]) -> None
         )
         console.print(f"ERROR: Failed to setup signal handlers: {str(e)}", style="red")
         sys.exit(1)
+
+    # Dummy progress for setup phases
+    setup_progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console
+    )
+    setup_task = setup_progress.add_task("Setup", total=None)
 
     try:
         async with Database(config, async_logger) as db:
@@ -299,7 +324,7 @@ async def run_async(ctx: click.Context, file: str, limit: Optional[int]) -> None
                 with Live(console=console, refresh_per_second=4, transient=False) as live:
                     # Read usernames from file
                     client.current_op = f"Reading usernames from {file}"
-                    live.update(client.generate_dashboard(0))
+                    live.update(client.generate_dashboard(0, progress=setup_progress))
                     try:
                         usernames = await _read_usernames_from_file(file, limit, async_logger)
                     except (FileNotFoundError, IOError, ValueError) as e:
@@ -319,12 +344,12 @@ async def run_async(ctx: click.Context, file: str, limit: Optional[int]) -> None
 
                     # Insert users into database
                     client.current_op = "Inserting users into database"
-                    live.update(client.generate_dashboard(0))
+                    live.update(client.generate_dashboard(0, progress=setup_progress))
                     await db.insert_users(usernames)
 
                     # Fetch pending users
                     client.current_op = "Fetching pending users"
-                    live.update(client.generate_dashboard(0))
+                    live.update(client.generate_dashboard(0, progress=setup_progress))
                     pending_users = await db.get_pending_users()
                     if not pending_users:
                         console.print(
@@ -353,16 +378,19 @@ async def run_async(ctx: click.Context, file: str, limit: Optional[int]) -> None
 
                     # Start metrics update task and process users concurrently
                     metrics_task = asyncio.create_task(client.periodic_update_metrics(db, session, METRICS_UPDATE_INTERVAL))
-                    tasks = [
-                        client.process_user(username, progress, task_id, live, db, session)
+                    user_tasks = [
+                        asyncio.create_task(client.process_user(username, progress, task_id, live, db, session))
                         for username in pending_users
                     ]
-                    await asyncio.gather(*tasks)
+                    tasks = [metrics_task] + user_tasks
+
+                    # Await all tasks
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
                     # Batch end animation
                     for i in range(3):
                         client.current_op = BATCH_END_ANIM[i % len(BATCH_END_ANIM)]
-                        live.update(client.generate_dashboard(0, "N/A", progress, anim_frame=i))
+                        live.update(client.generate_dashboard(0, progress=progress))
                         await asyncio.sleep(0.3)
 
                     # Finalize processing
@@ -377,7 +405,6 @@ async def run_async(ctx: click.Context, file: str, limit: Optional[int]) -> None
                             box=HEAVY
                         )
                     )
-                    metrics_task.cancel()
 
     except Exception as e:
         client.current_op = "Execution failed"
@@ -397,6 +424,14 @@ async def run_async(ctx: click.Context, file: str, limit: Optional[int]) -> None
         )
         sys.exit(1)
     finally:
+        # Ensure all tasks are cancelled and awaited before pool closure
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        try:
+            await asyncio.gather(*[t for t in tasks if not t.done()], return_exceptions=True)
+        except asyncio.CancelledError:
+            pass  # Expected during shutdown
         stop_event.set()
 
 @cli.command()

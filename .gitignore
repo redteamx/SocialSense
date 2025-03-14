@@ -31,3 +31,4 @@ tests/
 
 # specific folders
 afadesign.official
+bot.log.*

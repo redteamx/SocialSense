@@ -1,4 +1,8 @@
-# like_bot/instagram_client.py
+"""
+Instagram client module for the LikeBot application.
+
+Handles Instagram operations such as profile fetching, post liking, and metrics tracking.
+"""
 import json
 import time
 import asyncio
@@ -8,7 +12,7 @@ import threading
 import logging
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, List, Deque, Tuple
+from typing import Any, Dict, Optional, List, Deque, Tuple, AsyncGenerator
 
 import instaloader
 from aiograpi.exceptions import ClientError
@@ -45,11 +49,15 @@ from like_bot.config import (
 )
 from like_bot.logging import AsyncLogger
 from like_bot.enums.processing_status import ProcessingStatus
-from like_bot.decorators.retry import async_retrying
+from like_bot.decorators.retry import RetryHandler
 from .database import Database
 from .instagram_session import InstagramSession
 
 console = Console()
+
+# Initialize RetryHandler with desired max_retries
+retry_handler = RetryHandler(max_retries=NETWORK_MAX_RETRIES)
+async_retrying = retry_handler.retry
 
 class InstagramClient:
     """
@@ -58,7 +66,6 @@ class InstagramClient:
 
     Blocking operations (e.g., Instaloader API calls) are offloaded using asyncio.to_thread.
     """
-
     def __init__(self, config: Config, async_logger: AsyncLogger) -> None:
         """
         Initialize the InstagramClient with configuration and logging.
@@ -176,7 +183,7 @@ class InstagramClient:
             extra={"username": self.config.instagram_username}
         )
 
-    @async_retrying(max_retries=NETWORK_MAX_RETRIES, initial_delay=MIN_DELAY)
+    @async_retrying
     async def fetch_profile(self, username: str, context: instaloader.InstaloaderContext) -> instaloader.Profile:
         """
         Fetch the Instagram profile for the given username.
@@ -214,6 +221,7 @@ class InstagramClient:
         """
         if self._own_profile is None:
             await self.async_logger.debug("Fetching own profile", extra={"phase": "GetOwnProfile"})
+            print(f"Type of self.fetch_profile: {type(self.fetch_profile)}")  # Debug print
             self._own_profile = await self.fetch_profile(self.config.instagram_username, session.loader.context)
             await self.async_logger.debug(
                 f"Fetched own profile with userid {self._own_profile.userid}",
@@ -236,14 +244,15 @@ class InstagramClient:
             extra={"phase": "UpdateFollowerStatusStart"}
         )
         own_profile = await self.get_own_profile(session)
-        own_followers = await asyncio.to_thread(lambda: list(own_profile.get_followers()))
+        own_followers = await asyncio.to_thread(lambda: set(own_profile.get_followers()))
         current_followers = {follower.userid for follower in own_followers}
         await self.async_logger.debug(
             f"Found {len(current_followers)} followers for own profile",
             extra={"phase": "UpdateFollowerStatus"}
         )
 
-        async with db.pool.acquire() as conn:
+        conn = await db._acquire_connection()
+        try:
             target_users = await conn.fetch(
                 "SELECT id, profile_id FROM target_users WHERE profile_id IS NOT NULL"
             )
@@ -271,6 +280,8 @@ class InstagramClient:
                     """,
                     target_user_id, is_following
                 )
+        finally:
+            await db.pool.release(conn)
 
         await self.async_logger.debug(
             "Completed update_follower_status",
@@ -289,59 +300,36 @@ class InstagramClient:
             db (Database): The database instance for fetching metrics data.
         """
         await self.async_logger.debug("Starting update_metrics", extra={"phase": "UpdateMetricsStart"})
-        async with db.pool.acquire() as conn:
+        conn = await db._acquire_connection()
+        try:
             self._metrics["total_likes"] = await conn.fetchval("SELECT COUNT(*) FROM likes") or 0
             self._metrics["new_followers"] = await conn.fetchval(
                 "SELECT COUNT(*) FROM target_user_follow_status WHERE first_followed_at IS NOT NULL"
             ) or 0
             now = datetime.now()
-            start_of_year = datetime(now.year, 1, 1)
-            start_of_month = datetime(now.year, now.month, 1)
-            start_of_week = now - timedelta(days=now.weekday())
-            start_of_today = datetime(now.year, now.month, now.day)
-
-            self._metrics["followers_gained_year"] = await conn.fetchval(
-                "SELECT COUNT(*) FROM target_user_follow_status WHERE first_followed_at >= $1 AND first_followed_at IS NOT NULL",
-                start_of_year
-            ) or 0
-            self._metrics["followers_gained_month"] = await conn.fetchval(
-                "SELECT COUNT(*) FROM target_user_follow_status WHERE first_followed_at >= $1 AND first_followed_at IS NOT NULL",
-                start_of_month
-            ) or 0
-            self._metrics["followers_gained_week"] = await conn.fetchval(
-                "SELECT COUNT(*) FROM target_user_follow_status WHERE first_followed_at >= $1 AND first_followed_at IS NOT NULL",
-                start_of_week
-            ) or 0
-            self._metrics["followers_gained_today"] = await conn.fetchval(
-                "SELECT COUNT(*) FROM target_user_follow_status WHERE first_followed_at >= $1 AND first_followed_at IS NOT NULL",
-                start_of_today
-            ) or 0
-
-            self._metrics["followers_lost_year"] = await conn.fetchval(
-                "SELECT COUNT(*) FROM target_user_follow_status WHERE first_followed_at >= $1 AND is_currently_following = FALSE",
-                start_of_year
-            ) or 0
-            self._metrics["followers_lost_month"] = await conn.fetchval(
-                "SELECT COUNT(*) FROM target_user_follow_status WHERE first_followed_at >= $1 AND is_currently_following = FALSE",
-                start_of_month
-            ) or 0
-            self._metrics["followers_lost_week"] = await conn.fetchval(
-                "SELECT COUNT(*) FROM target_user_follow_status WHERE first_followed_at >= $1 AND is_currently_following = FALSE",
-                start_of_week
-            ) or 0
-            self._metrics["followers_lost_today"] = await conn.fetchval(
-                "SELECT COUNT(*) FROM target_user_follow_status WHERE first_followed_at >= $1 AND is_currently_following = FALSE",
-                start_of_today
-            ) or 0
-
+            for period, start in [
+                ("year", datetime(now.year, 1, 1)),
+                ("month", datetime(now.year, now.month, 1)),
+                ("week", now - timedelta(days=now.weekday())),
+                ("today", datetime(now.year, now.month, now.day)),
+            ]:
+                self._metrics[f"followers_gained_{period}"] = await conn.fetchval(
+                    "SELECT COUNT(*) FROM target_user_follow_status WHERE first_followed_at >= $1 AND first_followed_at IS NOT NULL",
+                    start
+                ) or 0
+                self._metrics[f"followers_lost_{period}"] = await conn.fetchval(
+                    "SELECT COUNT(*) FROM target_user_follow_status WHERE first_followed_at >= $1 AND is_currently_following = FALSE",
+                    start
+                ) or 0
             self._metrics["likes_per_follower_ratio"] = (
                 self._metrics["total_likes"] / self._metrics["new_followers"]
                 if self._metrics["new_followers"] > 0 else 0.0
             )
-
+        finally:
+            await db.pool.release(conn)
         await self.async_logger.debug("Completed update_metrics", extra={"phase": "UpdateMetricsEnd"})
 
-    async def periodic_update_metrics(self, db: Database, session: InstagramSession, interval: int) -> None:
+    async def periodic_update_metrics(self, db: Database, session: InstagramSession, interval: int = METRICS_UPDATE_INTERVAL) -> None:
         """
         Periodically update follower status and metrics.
 
@@ -362,7 +350,7 @@ class InstagramClient:
         Args:
             session (InstagramSession): The session object containing the Instagram client.
             mediaid (Any): The media ID to like.
-            timeout (int, optional): Timeout in seconds for the API call. Defaults to 5.
+            timeout (int): Timeout in seconds for the API call. Defaults to 5.
 
         Returns:
             bool: True if the media was liked successfully, False otherwise.
@@ -378,13 +366,44 @@ class InstagramClient:
                 f"Media like result for mediaid {media_id_str}: {result}",
                 extra={"phase": "CustomLikeMedia"}
             )
-            return result
-        except Exception as e:
+            return bool(result)
+        except ClientError as e:
+            error_msg = str(e).lower()
+            if "feedback_required" in error_msg or "400" in error_msg:
+                await self.async_logger.warning(
+                    f"Instagram feedback required or bad request: {str(e)}",
+                    extra={"mediaid": media_id_str, "phase": "CustomLikeMedia"}
+                )
+                return False
             await self.async_logger.error(
-                "Error in custom_like_media",
-                extra={"error": str(e), "mediaid": media_id_str}
+                "ClientError in custom_like_media",
+                extra={"error": str(e), "mediaid": media_id_str, "phase": "CustomLikeMedia"}
+            )
+            raise
+        except asyncio.TimeoutError:
+            await self.async_logger.warning(
+                "Timeout in custom_like_media",
+                extra={"mediaid": media_id_str, "phase": "CustomLikeMedia"}
             )
             return False
+
+    async def _fetch_posts(self, profile: instaloader.Profile) -> AsyncGenerator[instaloader.Post, None]:
+        """
+        Asynchronously fetch posts for a profile.
+
+        Args:
+            profile (instaloader.Profile): The profile to fetch posts from.
+
+        Yields:
+            instaloader.Post: Each post from the profile.
+        """
+        posts_iter = profile.get_posts()
+        while True:
+            try:
+                post = await asyncio.to_thread(next, posts_iter)
+                yield post
+            except StopIteration:
+                break
 
     async def process_user(self, username: str, progress: Progress, task_id: int, live: Live,
                            db: Database, session: InstagramSession) -> bool:
@@ -411,11 +430,14 @@ class InstagramClient:
             self._current_phase = "Processing"
             self._current_op = f"Processing {username}"
 
-            async with db.pool.acquire() as conn:
+            conn = await db._acquire_connection()
+            try:
                 retry_count = await conn.fetchval(
                     "SELECT retry_count FROM processed_users WHERE target_user_id = (SELECT id FROM target_users WHERE username = $1)",
                     username
                 ) or 0
+            finally:
+                await db.pool.release(conn)
 
             if retry_count >= MAX_RETRIES:
                 await db.update_user_status(username, ProcessingStatus.ERROR.value, retry_count)
@@ -426,245 +448,105 @@ class InstagramClient:
                 live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
                 return False
 
-            await self.async_logger.info(
-                "Starting user processing",
-                extra={"function": "process_user", "username": username, "retry_count": retry_count, "phase": "Processing"}
-            )
             progress.update(task_id, description=f"Processing {username}")
             live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
 
             try:
                 profile = await self.fetch_profile(username, session.loader.context)
-                async with db.pool.acquire() as conn:
+                conn = await db._acquire_connection()
+                try:
                     await conn.execute(
                         "UPDATE target_users SET profile_id = $1 WHERE username = $2",
                         profile.userid, username
                     )
-                await self.async_logger.info(
-                    "Profile fetched",
-                    extra={
-                        "function": "process_user",
-                        "username": username,
-                        "profile_id": profile.userid,
-                        "post_count": profile.mediacount,
-                        "phase": "Processing"
-                    }
-                )
-            except instaloader.exceptions.ProfileNotExistsException as e:
-                await self.async_logger.info(
-                    "Profile does not exist, skipping",
-                    extra={"function": "process_user", "username": username, "error": str(e), "phase": "Processing"}
-                )
-                status = ProcessingStatus.SKIPPED.value
+                finally:
+                    await db.pool.release(conn)
+            except instaloader.exceptions.ProfileNotExistsException:
+                await db.update_user_status(username, ProcessingStatus.SKIPPED.value, retry_count)
                 self._stats["skipped"] += 1
-                self._status_buffer.append((Text(f"⏸️ Skipped {username} (profile does not exist)", style="yellow"), time.time()))
-                await db.update_user_status(username, status, retry_count)
-                progress.update(task_id, advance=1)
+                self._status_buffer.append((Text(f"⏸️ Skipped {username} (not found)", style="yellow"), time.time()))
                 self._processed_count += 1
-                await asyncio.sleep(self.config.request_delay)
-                live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
-                return False
-            except Exception as e:
-                await self.async_logger.warning(
-                    "Transient error fetching profile",
-                    extra={"function": "process_user", "username": username, "error": str(e), "phase": "Processing"}
-                )
-                status = ProcessingStatus.RETRY.value
-                retry_count += 1
-                self._stats["retries"] += 1
-                delay = min(RATE_LIMIT_DELAY * (2 ** retry_count) + random.uniform(0, 1), MAX_DELAY)
-                self._status_buffer.append((Text(f"Retryable error for {username}: {str(e)}. Retrying after {delay:.1f}s ⏳", style="yellow"), time.time()))
-                await db.update_user_status(username, status, retry_count)
                 progress.update(task_id, advance=1)
-                self._processed_count += 1
                 live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
                 return False
 
             if profile.is_private or profile.mediacount == 0:
-                self._current_op = f"Skipping {username} ({'private' if profile.is_private else 'no posts'})"
-                status = ProcessingStatus.SKIPPED.value
+                await db.update_user_status(username, ProcessingStatus.SKIPPED.value, retry_count)
                 self._stats["skipped"] += 1
-                self._status_buffer.append((Text(f"⏸️ Skipped {username} ({'private' if profile.is_private else 'no posts'})", style="yellow"), time.time()))
-                await db.update_user_status(username, status, retry_count)
-                progress.update(task_id, advance=1)
+                self._status_buffer.append(
+                    (Text(f"⏸️ Skipped {username} ({'private' if profile.is_private else 'no posts'})", style="yellow"), time.time())
+                )
                 self._processed_count += 1
-                await asyncio.sleep(self.config.request_delay)
+                progress.update(task_id, advance=1)
                 live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
                 return False
 
-            # Check if the target user follows you
             own_profile = await self.get_own_profile(session)
-            own_followers = await asyncio.to_thread(lambda: list(own_profile.get_followers()))
-            follower_ids = {follower.userid for follower in own_followers}
-            if profile.userid in follower_ids:
-                await self.async_logger.info(
-                    f"User {username} already follows you; skipping",
-                    extra={"phase": "ProcessUserFollowCheck"}
-                )
+            own_followers = await asyncio.to_thread(lambda: set(own_profile.get_followers()))
+            if profile.userid in {f.userid for f in own_followers}:
                 return False
 
-            # Convert posts generator to a list
-            posts_list = await asyncio.to_thread(list, profile.get_posts())
-            await self.async_logger.debug(
-                f"Total posts fetched for {username}: {len(posts_list)}",
-                extra={"phase": "ProcessUserPostsList"}
-            )
-
-            post_to_like = None
-            post_number = 0
-            for idx, post in enumerate(posts_list, start=1):
-                await self.async_logger.debug(
-                    f"Checking post {idx} before reload: viewer_has_liked={post.viewer_has_liked}",
-                    extra={"phase": "ProcessUserPostIteration"}
-                )
+            async for post in self._fetch_posts(profile):
                 await asyncio.to_thread(post.reload)
-                await self.async_logger.debug(
-                    f"Post {idx} after reload: viewer_has_liked={post.viewer_has_liked}",
-                    extra={"phase": "ProcessUserPostIteration"}
-                )
                 if not post.viewer_has_liked:
-                    post_to_like = post
-                    post_number = idx
-                    await self.async_logger.debug(
-                        f"Selected post {idx} for liking",
-                        extra={"phase": "ProcessUserPostIteration"}
-                    )
-                    break
-
-            if post_to_like is None:
-                self._current_op = f"Skipping {username} (all posts liked)"
-                status = ProcessingStatus.SKIPPED.value
-                self._stats["skipped"] += 1
-                self._status_buffer.append((Text(f"⏸️ Skipped {username} (all posts liked)", style="yellow"), time.time()))
-                await db.update_user_status(username, status, retry_count)
-                progress.update(task_id, advance=1)
-                self._processed_count += 1
-                await asyncio.sleep(self.config.request_delay)
-                live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
-                return True
-
-            await self.async_logger.info(
-                f"Fetched post #{post_number} to like",
-                extra={"function": "process_user", "username": username, "shortcode": post_to_like.shortcode, "phase": "Processing"}
-            )
-            await asyncio.sleep(self.config.intra_request_delay)
-
-            self._current_op = f"Liking post #{post_number} for {username}"
-            await self.async_logger.debug(
-                f"Attempting to like media for user {username} on post #{post_number} with mediaid: {post_to_like.mediaid}",
-                extra={"phase": "ProcessUserLikeAttempt"}
-            )
-            liked = await self.custom_like_media(session, post_to_like.mediaid, timeout=5)
-            if liked:
-                self._stats["liked"] += 1
-                self._status_buffer.append((Text(f"✅ Liked {username}'s post #{post_number}", style="green"), time.time()))
-                await self.async_logger.info(
-                    f"Post #{post_number} liked",
-                    extra={"function": "process_user", "username": username, "phase": "Processing"}
-                )
-                async with db.pool.acquire() as conn:
-                    target_user_id = await conn.fetchval(
-                        "SELECT id FROM target_users WHERE username = $1", username
-                    )
-                    if target_user_id:
-                        await conn.execute(
-                            "INSERT INTO likes (target_user_id, post_shortcode) VALUES ($1, $2)",
-                            target_user_id, post_to_like.shortcode
+                    liked, retry_count, status = await self._like_post(username, post, retry_count, session)
+                    await db.update_user_status(username, status, retry_count)
+                    if liked:
+                        self._stats["liked"] += 1
+                        self._status_buffer.append((Text(f"✅ Liked {username}'s post", style="green"), time.time()))
+                        conn = await db._acquire_connection()
+                        try:
+                            target_user_id = await conn.fetchval(
+                                "SELECT id FROM target_users WHERE username = $1", username
+                            )
+                            await conn.execute(
+                                "INSERT INTO likes (target_user_id, post_shortcode) VALUES ($1, $2)",
+                                target_user_id, post.shortcode
+                            )
+                        finally:
+                            await db.pool.release(conn)
+                    else:
+                        self._stats["errors" if retry_count >= MAX_RETRIES else "retries"] += 1
+                        self._status_buffer.append(
+                            (Text(f"{'✘' if retry_count >= MAX_RETRIES else '🔄'} {'Failed' if retry_count >= MAX_RETRIES else 'Retrying'} {username}'s post", style="red" if retry_count >= MAX_RETRIES else "yellow"), time.time())
                         )
+                    self._processed_count += 1
+                    progress.update(task_id, advance=1)
+                    live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
+                    break
             else:
-                self._stats["errors"] += 1
-                self._status_buffer.append((Text(f"✘ Failed to like {username}'s post", style="red"), time.time()))
-                await self.async_logger.error(
-                    "Failed to like post",
-                    extra={"function": "process_user", "username": username, "phase": "Processing"}
-                )
-                status = ProcessingStatus.ERROR.value
+                await db.update_user_status(username, ProcessingStatus.SKIPPED.value, retry_count)
+                self._stats["skipped"] += 1
+                self._status_buffer.append((Text(f"⏸️ Skipped {username} (all liked)", style="yellow"), time.time()))
+                self._processed_count += 1
+                progress.update(task_id, advance=1)
+                live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
 
-            await db.update_user_status(username, status, retry_count)
-            progress.update(task_id, advance=1)
-            live.update(self.generate_dashboard(progress.tasks[0].total - progress.tasks[0].completed, username, progress))
-            self._processed_count += 1
-            elapsed = time.perf_counter() - start_time
-            await self.async_logger.debug(
-                f"Finished processing {username} in {elapsed:.2f} seconds",
-                extra={"phase": "ProcessUserEnd"}
-            )
-            self.debug_state()
-            await asyncio.sleep(self.config.request_delay)
+            own_followers = await asyncio.to_thread(lambda: set(own_profile.get_followers()))
+            return profile.userid not in {f.userid for f in own_followers}
 
-            # Re-check if the user now follows you
-            updated_profile = await self.fetch_profile(username, session.loader.context)
-            own_profile = await self.get_own_profile(session)
-            own_followers = await asyncio.to_thread(lambda: list(own_profile.get_followers()))
-            follower_ids = {follower.userid for follower in own_followers}
-            if updated_profile.userid not in follower_ids:
-                await self.async_logger.debug(
-                    f"User {username} still does not follow you; will be requeued",
-                    extra={"phase": "ProcessUserRequeueCheck"}
-                )
-                return True
-            else:
-                await self.async_logger.info(
-                    f"User {username} now follows you; removing from queue",
-                    extra={"phase": "ProcessUserRequeueCheck"}
-                )
-                return False
-
-    async def _like_post(self, username: str, post_to_like: Any, retry_count: int, session: InstagramSession) -> Tuple[bool, int, str]:
+    async def _like_post(self, username: str, post: instaloader.Post, retry_count: int, session: InstagramSession) -> Tuple[bool, int, str]:
         """
         Attempt to like a given post with retries and error handling.
 
         Args:
             username (str): The username associated with the post.
-            post_to_like (Any): The post object to like.
+            post (instaloader.Post): The post object to like.
             retry_count (int): Current retry count for the operation.
             session (InstagramSession): The session object.
 
         Returns:
             Tuple[bool, int, str]: (success, updated_retry_count, status)
         """
-        for attempt in range(MAX_RETRIES):
-            await self.async_logger.debug(
-                f"Attempt {attempt + 1} to like post {post_to_like.shortcode} for {username}",
-                extra={"phase": "LikePostAttempt"}
-            )
+        for attempt in range(MAX_RETRIES - retry_count):
             try:
-                liked = await self.custom_like_media(session, post_to_like.mediaid, timeout=5)
-                await self.async_logger.debug(
-                    f"Result of like attempt {attempt + 1} for {username}: {liked}",
-                    extra={"phase": "LikePostAttempt"}
-                )
-                if liked:
-                    return True, retry_count, ProcessingStatus.LIKED.value
-                else:
-                    return False, retry_count, ProcessingStatus.ERROR.value
-            except asyncio.TimeoutError:
-                await self.async_logger.warning(
-                    "Timeout while liking post",
-                    extra={"username": username, "attempt": attempt + 1, "phase": "Processing"}
-                )
+                liked = await self.custom_like_media(session, post.mediaid)
+                return liked, retry_count, ProcessingStatus.LIKED.value if liked else ProcessingStatus.ERROR.value
+            except (asyncio.TimeoutError, ClientError) as e:
                 retry_count += 1
-            except ClientError as e:
-                if "rate_limit" in str(e).lower() or "429" in str(e):
-                    wait_time = min((2 ** attempt) * RATE_LIMIT_DELAY + random.uniform(0, 1), MAX_DELAY)
-                    await self.async_logger.warning(
-                        "Rate limited when liking post",
-                        extra={"username": username, "attempt": attempt + 1, "max_retries": MAX_RETRIES, "delay": wait_time, "phase": "Processing"}
-                    )
-                    self._status_buffer.append((Text(f"Rate limited for {username}, waiting {wait_time:.1f}s ⏳", style="yellow"), time.time()))
-                    await asyncio.sleep(wait_time)
-                else:
-                    await self.async_logger.warning(
-                        "Transient error liking post",
-                        extra={"function": "process_user", "username": username, "error": str(e), "phase": "Processing"}
-                    )
-                    retry_count += 1
-                    if attempt == MAX_RETRIES - 1:
-                        self._status_buffer.append((Text(f"✘ Max retries reached for {username} liking post", style="red"), time.time()))
-                        return False, retry_count, ProcessingStatus.ERROR.value
-                    delay = min((2 ** attempt) * RATE_LIMIT_DELAY + random.uniform(0, 1), MAX_DELAY)
-                    self._status_buffer.append((Text(f"Retryable error for {username}: {str(e)}. Retrying after {delay:.1f}s ⏳", style="yellow"), time.time()))
-                    await asyncio.sleep(delay)
+                delay = min(RATE_LIMIT_DELAY * (2 ** attempt) + random.uniform(0, 1), MAX_DELAY)
+                self._status_buffer.append((Text(f"🔄 Retry {username} after {delay:.1f}s: {str(e)}", style="yellow"), time.time()))
+                await asyncio.sleep(delay)
         return False, retry_count, ProcessingStatus.ERROR.value
 
     def generate_dashboard(self, pending_users: int, current_username: str = "N/A", progress: Optional[Progress] = None, anim_frame: int = 0) -> Layout:
@@ -839,12 +721,12 @@ class InstagramClient:
         console.print(Panel(tree, border_style=THEMES[self.config.theme]["success"], box=HEAVY))
         return summary
 
-    async def shutdown(self, stop_event: threading.Event) -> None:
+    async def shutdown(self, stop_event: asyncio.Event) -> None:
         """
         Gracefully shut down the client by generating a summary report and signaling termination.
 
         Args:
-            stop_event (threading.Event): Event to signal termination.
+            stop_event (asyncio.Event): Event to signal termination.
         """
         self._current_op = "Shutting down"
         await self.async_logger.info(
@@ -859,7 +741,6 @@ class InstagramClient:
             box=HEAVY
         ))
         stop_event.set()
-        sys.exit(0)
 
     async def process_queue(self, user_list: List[str], db: Database, session: InstagramSession) -> None:
         """
@@ -879,23 +760,9 @@ class InstagramClient:
             SpinnerColumn("dots")
         )
         task_id = progress.add_task("Processing Users", total=len(user_list))
-        async with Live(self.generate_dashboard(len(queue)), refresh_per_second=2) as live:
+        async with Live(self.generate_dashboard(len(queue), progress=progress), refresh_per_second=2) as live:
             while queue:
                 username = queue.popleft()
-                await self.async_logger.debug(
-                    f"Dequeued user: {username}",
-                    extra={"phase": "ProcessQueue"}
-                )
-                needs_requeue = await self.process_user(username, progress, task_id, live, db, session)
-                if needs_requeue:
-                    await self.async_logger.debug(
-                        f"Re-queuing user: {username}",
-                        extra={"phase": "ProcessQueue"}
-                    )
+                if await self.process_user(username, progress, task_id, live, db, session):
                     queue.append(username)
-                progress.update(task_id, completed=len(user_list) - len(queue))
                 await asyncio.sleep(1)
-            await self.async_logger.info(
-                "All users now follow you; queue is empty",
-                extra={"phase": "ProcessQueue"}
-            )
