@@ -1,0 +1,17 @@
+# SocialSense/.gitignore
+.venv*
+*.log
+*.pyc
+__pycache__/*
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+*.lock
+*.bak
+.env
+scripts/
+backups/
+qodana.yaml*
+# Project exclude paths
+/apps/instagram_app/.ig_venv/

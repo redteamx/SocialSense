@@ -1,0 +1,21 @@
+# instagram_app/resources/config.yaml
+app:
+  name: "InstagramApp"
+  version: "1.0.0"
+database:
+  postgres:
+    url: "postgresql://rtx:pixel4Loud3total@localhost:5432/instagram_db"
+  cassandra:
+    host: "localhost"
+    port: 9042
+    keyspace: "instagram_db"  # Already correct, matches Cassandra keyspace
+redis:
+  host: "localhost"
+  port: 6379
+  password: "password"
+instagram:
+  username: "afadesign.official"
+  password: "pixel4Loud3total"
+logging:
+  level: "INFO"
+  file: "logs/app.log"

@@ -1,0 +1,43 @@
+# instagram_app/resources/docker-compose.yml
+version: "3.8"
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      - DATABASE_URL=postgresql://rtx:pixel4Loud3total@postgres:5432/instagram_db
+      - REDIS_HOST=redis
+      - CASSANDRA_HOST=cassandra
+      - CASSANDRA_KEYSPACE=instagram_db  # Added to match keyspace
+    depends_on:
+      - postgres
+      - redis
+      - cassandra
+  postgres:
+    image: postgres:17
+    environment:
+      - POSTGRES_USER=rtx
+      - POSTGRES_PASSWORD=pixel4Loud3total
+      - POSTGRES_DB=instagram_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+  redis:
+    image: redis:7
+    command: redis-server --requirepass password
+    volumes:
+      - redis_data:/data
+  cassandra:
+    image: cassandra:4.1
+    environment:
+      - CASSANDRA_AUTHENTICATOR=PasswordAuthenticator
+      - CASSANDRA_USER=rtx
+      - CASSANDRA_PASSWORD=pixel4Loud3total
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+volumes:
+  postgres_data:
+  redis_data:
+  cassandra_data:
